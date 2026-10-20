@@ -18,6 +18,8 @@ sealed class TrayApp : ApplicationContext
     readonly ToolStripMenuItem _auto = new("Automatic handoff") { CheckOnClick = true };
     readonly ToolStripMenuItem _pause = new("Pause when a bud is removed") { CheckOnClick = true };
     readonly ToolStripMenuItem _startup = new("Start with Windows") { CheckOnClick = true };
+    readonly ToolStripMenuItem _connect = new("Connect now");
+    readonly ToolStripMenuItem _disconnect = new("Disconnect now");
     string _iconKey = "";
 
     public TrayApp()
@@ -39,8 +41,10 @@ sealed class TrayApp : ApplicationContext
         menu.Items.Add(_pause);
         menu.Items.Add(_startup);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Connect now", null, (_, _) => _controller.ConnectNow());
-        menu.Items.Add("Disconnect now", null, (_, _) => _controller.DisconnectNow());
+        _connect.Click += (_, _) => _controller.ConnectNow();
+        _disconnect.Click += (_, _) => _controller.DisconnectNow();
+        menu.Items.Add(_connect);
+        menu.Items.Add(_disconnect);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open config", null, (_, _) => Open(Config.FilePath));
         menu.Items.Add("Open log", null, (_, _) => Open(Log.FilePath));
@@ -66,6 +70,8 @@ sealed class TrayApp : ApplicationContext
         if (s.GrabSuppressed) link += " (held by other device)";
 
         _status.Text = $"{link} — {pods}";
+        _connect.Enabled = !s.Connected;
+        _disconnect.Enabled = s.Connected;
         var tip = $"AirPods: {link}\n{pods}\n{s.LastAction}";
         _tray.Text = tip.Length > 127 ? tip[..127] : tip;
 
