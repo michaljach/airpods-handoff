@@ -6,7 +6,7 @@ Tray app that gives a Windows PC handoff-style switching for AirPods (built and 
 - Release: after 2 min without PC audio, it disconnects so your Apple devices can take them back.
 - Don't fight: if another device takes the AirPods while the PC is still playing, auto-grab pauses until the PC goes quiet.
 - Ear detection: removing a bud pauses media; putting it back resumes it.
-- Tray icon: shows the lowest bud battery, green when connected to the PC.
+- Tray icon: shows the lowest bud battery, green when connected to the PC. Double-click toggles: connect, or give the AirPods back (auto-grab waits until PC audio stops).
 
 Calls (mic in use) count as activity, so the AirPods are never released mid-meeting.
 

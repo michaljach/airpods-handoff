@@ -19,8 +19,10 @@ sealed class TrayApp : ApplicationContext
     readonly ToolStripMenuItem _pause = new("Pause when a bud is removed") { CheckOnClick = true };
     readonly ToolStripMenuItem _startup = new("Start with Windows") { CheckOnClick = true };
     readonly ToolStripMenuItem _connect = new("Connect now");
-    readonly ToolStripMenuItem _disconnect = new("Disconnect now");
+    readonly ToolStripMenuItem _disconnect = new("Disconnect now (give back to phone)");
+    const int SpinFrames = 12;
     string _iconKey = "";
+    int _spinFrame;
 
     public TrayApp()
     {
@@ -41,8 +43,8 @@ sealed class TrayApp : ApplicationContext
         menu.Items.Add(_pause);
         menu.Items.Add(_startup);
         menu.Items.Add(new ToolStripSeparator());
-        _connect.Click += (_, _) => _controller.ConnectNow();
-        _disconnect.Click += (_, _) => _controller.DisconnectNow();
+        _connect.Click += (_, _) => { _controller.ConnectNow(); Refresh(); };
+        _disconnect.Click += (_, _) => { _controller.DisconnectNow(); Refresh(); };
         menu.Items.Add(_connect);
         menu.Items.Add(_disconnect);
         menu.Items.Add(new ToolStripSeparator());
@@ -50,7 +52,14 @@ sealed class TrayApp : ApplicationContext
         menu.Items.Add("Open log", null, (_, _) => Open(Log.FilePath));
         menu.Items.Add("Exit", null, (_, _) => ExitThread());
         _tray.ContextMenuStrip = menu;
-        _tray.DoubleClick += (_, _) => _controller.ConnectNow();
+        _tray.DoubleClick += (_, _) =>
+        {
+            var s = _controller.Current;
+            if (s.Op != LinkOp.None) return;
+            if (s.Connected) _controller.DisconnectNow();
+            else _controller.ConnectNow();
+            Refresh();
+        };
 
         _uiTimer.Tick += (_, _) => Refresh();
         _uiTimer.Start();
@@ -66,29 +75,42 @@ sealed class TrayApp : ApplicationContext
             ? "no BLE data"
             : $"L {Pct(p.LeftBattery)}{(p.LeftCharging ? "+" : "")}  R {Pct(p.RightBattery)}{(p.RightCharging ? "+" : "")}  "
               + $"case {Pct(p.CaseBattery)}{(p.CaseCharging ? "+" : "")}  in ear {p.InEarCount}";
-        string link = s.Connected ? "Connected to PC" : "Not connected";
-        if (s.GrabSuppressed) link += " (held by other device)";
+        bool busy = s.Op != LinkOp.None;
+        string link = s.Op switch
+        {
+            LinkOp.Connecting => "Connecting…",
+            LinkOp.Disconnecting => "Disconnecting…",
+            _ => s.Connected ? "Connected to PC" : "Not connected",
+        };
+        if (s.GrabSuppressed && !busy) link += " (auto-grab paused)";
 
         _status.Text = $"{link} — {pods}";
-        _connect.Enabled = !s.Connected;
-        _disconnect.Enabled = s.Connected;
+        _connect.Enabled = !s.Connected && !busy;
+        _disconnect.Enabled = s.Connected && !busy;
         var tip = $"AirPods: {link}\n{pods}\n{s.LastAction}";
         _tray.Text = tip.Length > 127 ? tip[..127] : tip;
 
+        // Tick fast while busy so the spinner moves; 1 s is plenty otherwise.
+        _uiTimer.Interval = busy ? 120 : 1000;
+        if (busy) _spinFrame = (_spinFrame + 1) % SpinFrames;
+
         string label = p?.LowestPodBattery is { } b ? (b == 100 ? "99" : b.ToString()) : "–";
-        string key = $"{label}|{s.Connected}";
+        string key = $"{label}|{s.Connected}|{(busy ? _spinFrame : -1)}";
         if (key != _iconKey)
         {
             _iconKey = key;
             var old = _tray.Icon;
-            _tray.Icon = RenderIcon(label, s.Connected ? Color.FromArgb(0x2E, 0x7D, 0x32) : Color.FromArgb(0x61, 0x61, 0x61));
+            var background = busy ? Color.FromArgb(0x15, 0x65, 0xC0)
+                : s.Connected ? Color.FromArgb(0x2E, 0x7D, 0x32) : Color.FromArgb(0x61, 0x61, 0x61);
+            _tray.Icon = RenderIcon(label, background, busy ? _spinFrame : null);
             old?.Dispose();
         }
     }
 
     static string Pct(int? v) => v is { } x ? $"{x}%" : "?";
 
-    static Icon RenderIcon(string text, Color background)
+    // spinFrame: draw a rotating arc around the edge (connect/disconnect in progress).
+    static Icon RenderIcon(string text, Color background, int? spinFrame)
     {
         using var bmp = new Bitmap(32, 32);
         using (var g = Graphics.FromImage(bmp))
@@ -98,6 +120,11 @@ sealed class TrayApp : ApplicationContext
             g.Clear(Color.Transparent);
             using var brush = new SolidBrush(background);
             g.FillEllipse(brush, 0, 0, 31, 31);
+            if (spinFrame is { } frame)
+            {
+                using var pen = new Pen(Color.White, 3f);
+                g.DrawArc(pen, 2, 2, 27, 27, frame * 360f / SpinFrames, 100);
+            }
             using var font = new Font("Segoe UI", 16f, FontStyle.Bold, GraphicsUnit.Pixel);
             using var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
             g.DrawString(text, font, Brushes.White, new RectangleF(0, 1, 32, 32), format);

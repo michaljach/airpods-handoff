@@ -2,7 +2,9 @@ using Windows.Media.Control;
 
 namespace AirPodsHandoff;
 
-sealed record Snapshot(bool Connected, AirPodsState? Pods, bool PcActive, bool GrabSuppressed, string LastAction);
+enum LinkOp { None, Connecting, Disconnecting }
+
+sealed record Snapshot(bool Connected, AirPodsState? Pods, bool PcActive, bool GrabSuppressed, string LastAction, LinkOp Op);
 
 // The policy loop. Every 500 ms:
 //   - PC audio active for GrabAfterMs, buds in ear, AirPods not connected here -> connect (take them from the phone)
@@ -16,6 +18,8 @@ sealed class HandoffController : IDisposable
     static readonly TimeSpan InEarDebounce = TimeSpan.FromSeconds(1);
     static readonly TimeSpan ResumeWithin = TimeSpan.FromMinutes(5);
     static readonly TimeSpan SuppressionClearsAfter = TimeSpan.FromSeconds(5);
+    // Taking the AirPods from the phone routinely takes 20-25 s.
+    static readonly TimeSpan OpTimeout = TimeSpan.FromSeconds(45);
 
     readonly Config _cfg;
     readonly BleMonitor _ble;
@@ -42,7 +46,13 @@ sealed class HandoffController : IDisposable
     int _inEarBeforePause;
     DateTime _pausedAt;
 
-    public Snapshot Current { get; private set; } = new(false, null, false, false, "starting");
+    // A connect/disconnect stays in flight from the request until the endpoint state flips (or OpTimeout),
+    // so the tray can show progress and nothing else is fired meanwhile.
+    readonly object _opLock = new();
+    LinkOp _op;
+    DateTime _opStarted;
+
+    public Snapshot Current { get; private set; } = new(false, null, false, false, "starting", LinkOp.None);
 
     public HandoffController(Config cfg)
     {
@@ -61,17 +71,53 @@ sealed class HandoffController : IDisposable
         });
     }
 
-    public Task ConnectNow() => Task.Run(() =>
+    public void ConnectNow()
     {
+        if (!TryBeginOp(LinkOp.Connecting)) return;
         _grabSuppressed = false;
-        _bt.Connect();
-    });
+        Task.Run(() => { if (!_bt.Connect()) EndOp(); });
+    }
 
-    public Task DisconnectNow() => Task.Run(() =>
+    // Manual release: hold off auto-grab until PC audio stops, or it would grab them right back.
+    public void DisconnectNow()
     {
+        if (!TryBeginOp(LinkOp.Disconnecting)) return;
+        _grabSuppressed = true;
         _lastOwnDisconnect = DateTime.UtcNow;
-        _bt.Disconnect();
-    });
+        Task.Run(() => { if (!_bt.Disconnect()) EndOp(); });
+    }
+
+    bool TryBeginOp(LinkOp op)
+    {
+        lock (_opLock)
+        {
+            if (_op != LinkOp.None) return false;
+            _op = op;
+            _opStarted = DateTime.UtcNow;
+        }
+        Current = Current with { Op = op };
+        return true;
+    }
+
+    void EndOp()
+    {
+        lock (_opLock) _op = LinkOp.None;
+        Current = Current with { Op = LinkOp.None };
+    }
+
+    // Finishes the in-flight op once the endpoint reaches the target state or it times out.
+    LinkOp SettleOp(bool connected, DateTime now)
+    {
+        lock (_opLock)
+        {
+            if (_op == LinkOp.None) return _op;
+            bool reached = _op == LinkOp.Connecting ? connected : !connected;
+            if (!reached && now - _opStarted < OpTimeout) return _op;
+            var elapsed = (now - _opStarted).TotalSeconds;
+            Log.Info($"bt: {_op.ToString().ToLowerInvariant()} {(reached ? "done" : "timed out")} after {elapsed:F1}s");
+            return _op = LinkOp.None;
+        }
+    }
 
     async Task TickAsync()
     {
@@ -141,6 +187,7 @@ sealed class HandoffController : IDisposable
             }
         }
         _wasConnected = connected;
+        var op = SettleOp(connected, now);
 
         int? inEar = UpdateInEar(pods?.InEarCount, now);
         if (inEar is { } count && _pendingTransition is { } prev)
@@ -157,29 +204,36 @@ sealed class HandoffController : IDisposable
         }
 
         string action = Current.LastAction;
-        if (_cfg.AutoHandoff && !_grabSuppressed)
+        if (_cfg.AutoHandoff && !_grabSuppressed && op == LinkOp.None)
         {
             if (!connected
                 && _activeSince is { } since && now - since >= TimeSpan.FromMilliseconds(_cfg.GrabAfterMs)
                 && wearing
-                && now - _lastConnectAttempt > ConnectRetryAfter)
+                && now - _lastConnectAttempt > ConnectRetryAfter
+                && TryBeginOp(LinkOp.Connecting))
             {
                 _lastConnectAttempt = now;
                 Log.Info($"handoff: PC audio active (peak={peak:F3} media={playing.Count} mic={mic}), grabbing AirPods");
-                action = _bt.Connect() ? $"grabbed {DateTime.Now:HH:mm}" : "grab failed";
+                bool ok = _bt.Connect();
+                if (!ok) EndOp();
+                action = ok ? $"grabbed {DateTime.Now:HH:mm}" : "grab failed";
             }
             else if (connected
                 && _cfg.ReleaseAfterSeconds > 0
-                && now - _lastActive >= TimeSpan.FromSeconds(_cfg.ReleaseAfterSeconds))
+                && now - _lastActive >= TimeSpan.FromSeconds(_cfg.ReleaseAfterSeconds)
+                && TryBeginOp(LinkOp.Disconnecting))
             {
                 Log.Info($"handoff: no PC audio for {_cfg.ReleaseAfterSeconds}s, releasing AirPods");
                 _lastOwnDisconnect = now;
                 _lastActive = now; // don't hammer if the disconnect doesn't take
-                action = _bt.Disconnect() ? $"released {DateTime.Now:HH:mm}" : "release failed";
+                bool ok = _bt.Disconnect();
+                if (!ok) EndOp();
+                action = ok ? $"released {DateTime.Now:HH:mm}" : "release failed";
             }
         }
 
-        Current = new Snapshot(connected, pods, active, _grabSuppressed, action);
+        lock (_opLock) op = _op; // a click may have started one during this tick
+        Current = new Snapshot(connected, pods, active, _grabSuppressed, action, op);
     }
 
     // BLE in-ear bits flicker for a moment while a bud is moving; only accept a count held for 1 s.
